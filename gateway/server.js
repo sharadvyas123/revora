@@ -13,9 +13,15 @@ const { v4: uuidv4 } = require('uuid');
 const DatabaseManager = require('../db/database');
 const CatalogService = require('./services/catalog.service');
 const MandateService = require('./services/mandate.service');
+const PaymentService = require('./services/payment.service');
+const AuditService = require('./services/audit.service');
+const RazorpayWrapper = require('../lib/razorpay');
 const createCatalogRoutes = require('./routes/catalog.routes');
 const createMandateRoutes = require('./routes/mandate.routes');
+const createPaymentRoutes = require('./routes/payment.routes');
+const createAuditRoutes = require('./routes/audit.routes');
 const { errorHandler } = require('./middleware/error.middleware');
+const { createAuditMiddleware } = require('./middleware/audit.middleware');
 const logger = require('../lib/logger');
 
 // ── Load config (validates env vars) ────────────────────────────────
@@ -33,8 +39,14 @@ dbManager.initialize();
 logger.info('Database initialized', { path: config.db.path });
 
 // ── Initialize Services ─────────────────────────────────────────────
+const auditService = new AuditService(dbManager.db);
 const catalogService = new CatalogService(dbManager.db);
-const mandateService = new MandateService(dbManager.db);
+const mandateService = new MandateService(dbManager.db, auditService);
+const razorpay = new RazorpayWrapper({
+  keyId: config.razorpay.keyId,
+  keySecret: config.razorpay.keySecret,
+});
+const paymentService = new PaymentService(dbManager.db, razorpay, auditService);
 
 // ── Create Express App ──────────────────────────────────────────────
 const app = express();
@@ -50,6 +62,9 @@ app.use((req, res, next) => {
   res.setHeader('X-Trace-Id', req.traceId);
   next();
 });
+
+// Run audit middleware globally
+app.use(createAuditMiddleware(auditService));
 
 // Request logging
 app.use((req, res, next) => {
@@ -90,6 +105,11 @@ app.get('/health', (req, res) => {
 // ── API Routes ──────────────────────────────────────────────────────
 app.use('/api/v1/catalog', createCatalogRoutes(catalogService));
 app.use('/api/v1/mandates', createMandateRoutes(mandateService));
+app.use('/api/v1/payments', createPaymentRoutes(paymentService));
+app.use('/api/v1/audit', createAuditRoutes(auditService));
+
+// Attach audit service to app for use in other services
+app.set('auditService', auditService);
 
 // ── 404 Handler ─────────────────────────────────────────────────────
 app.use((req, res) => {

@@ -21,8 +21,8 @@
 const MERCHANT = {
   merchant_id: 'merch_sportshub',
   name: 'SportHub India',
-  rz_key_id: 'rzp_test_xxxxxxxxxxxxx',     // Replace with real test key
-  rz_key_secret: 'xxxxxxxxxxxxxxxxxxxxxxxx', // Replace with real test secret
+  rz_key_id: 'rzp_test_TTW2dAShJaC62N',     // Replace with real test key
+  rz_key_secret: 'VtAjTzSqrj3p4wQUXVH0sfui', // Replace with real test secret
   webhook_url: 'http://localhost:3000/api/v1/webhooks/razorpay',
   status: 'ACTIVE',
 };

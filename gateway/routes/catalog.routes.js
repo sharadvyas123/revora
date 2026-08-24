@@ -135,6 +135,19 @@ function createCatalogRoutes(catalogService) {
     try {
       const result = catalogService.search(req.query);
 
+      if (req.headers['x-audit-trail-id'] && req.audit) {
+        req.audit.logDiscovery(req.auditTrailId, {
+          agent_id: req.headers['x-agent-id'] || 'N/A',
+          query: req.query.q,
+          keywords: req.query.q.split(/\s+/),
+          results_count: result.total_matches,
+          top_results: result.results.map((r) => ({
+            product_id: r.product.product_id,
+            relevance_score: r.relevance_score,
+          })),
+        });
+      }
+
       res.json({
         status: 'success',
         data: result,

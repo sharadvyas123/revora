@@ -42,9 +42,11 @@ const {
 class MandateService {
   /**
    * @param {import('better-sqlite3').Database} db - The better-sqlite3 database instance
+   * @param {import('./audit.service')} [auditService] - Optional AuditService instance
    */
-  constructor(db) {
+  constructor(db, auditService) {
     this.db = db;
+    this.auditService = auditService || null;
   }
 
   // ════════════════════════════════════════════════════════════════════
@@ -117,6 +119,20 @@ class MandateService {
       now.toISOString(),
       expiresAt.toISOString()
     );
+
+    if (this.auditService) {
+      const maxAmtDisplay = `₹${(normalizedConstraints.max_amount / 100).toLocaleString('en-IN', { minimumFractionDigits: 2 })}`;
+      const cats = normalizedConstraints.allowed_categories.length > 0
+        ? normalizedConstraints.allowed_categories.join(', ')
+        : 'any category';
+      const descQuery = `Authorize agent ${agent_id} to spend up to ${maxAmtDisplay} on ${cats}`;
+      this.auditService.logRequest(mandateId, {
+        agent_id,
+        delegator_id,
+        query: descQuery,
+        constraints: normalizedConstraints,
+      });
+    }
 
     logger.info('Intent mandate created', {
       mandate_id: mandateId,
@@ -193,6 +209,22 @@ class MandateService {
       // Validate category constraint
       if (constraints.allowed_categories && constraints.allowed_categories.length > 0) {
         if (!constraints.allowed_categories.includes(product.category)) {
+          if (this.auditService) {
+            this.auditService.logMandateCheck(intent_mandate_id, {
+              mandate_id: intent_mandate_id,
+              mandate_type: 'INTENT',
+              constraints,
+              check_result: 'FAILED',
+              violation: `Category "${product.category}" is not in the allowed list: [${constraints.allowed_categories.join(', ')}]`,
+            });
+            this.auditService.logOutcome(intent_mandate_id, {
+              transaction_id: 'N/A',
+              status: 'FAILED',
+              total_amount: 0,
+              items_count: items.length,
+              failure_reason: `Category "${product.category}" not allowed`,
+            });
+          }
           throw new CategoryViolationError(
             intent_mandate_id, product.category, constraints.allowed_categories
           );
@@ -202,6 +234,22 @@ class MandateService {
       // Validate merchant constraint
       if (constraints.allowed_merchants && constraints.allowed_merchants.length > 0) {
         if (!constraints.allowed_merchants.includes(product.merchant_id)) {
+          if (this.auditService) {
+            this.auditService.logMandateCheck(intent_mandate_id, {
+              mandate_id: intent_mandate_id,
+              mandate_type: 'INTENT',
+              constraints,
+              check_result: 'FAILED',
+              violation: `Merchant "${product.merchant_id}" is not in the allowed list`,
+            });
+            this.auditService.logOutcome(intent_mandate_id, {
+              transaction_id: 'N/A',
+              status: 'FAILED',
+              total_amount: 0,
+              items_count: items.length,
+              failure_reason: `Merchant "${product.merchant_id}" not allowed`,
+            });
+          }
           throw new MerchantViolationError(
             intent_mandate_id, product.merchant_id, constraints.allowed_merchants
           );
@@ -236,12 +284,46 @@ class MandateService {
 
     // ── Step 3: Validate total amount against spend cap ──────────────
     if (totalAmount > constraints.max_amount) {
+      if (this.auditService) {
+        this.auditService.logMandateCheck(intent_mandate_id, {
+          mandate_id: intent_mandate_id,
+          mandate_type: 'INTENT',
+          constraints,
+          check_result: 'FAILED',
+          violation: `Amount ${totalAmount} exceeds max_amount ${constraints.max_amount}`,
+        });
+        this.auditService.logOutcome(intent_mandate_id, {
+          transaction_id: 'N/A',
+          status: 'FAILED',
+          total_amount: totalAmount,
+          items_count: items.length,
+          failure_reason: `Spend cap exceeded: total ${totalAmount} > cap ${constraints.max_amount}`,
+        });
+      }
       throw new AmountExceededError(
         intent_mandate_id,
         constraints.max_amount,
         totalAmount,
         constraints.currency
       );
+    }
+
+    // Log decision and successful mandate check
+    if (this.auditService) {
+      this.auditService.logDecision(intent_mandate_id, {
+        agent_id,
+        selected_product: resolvedItems.map(i => `${i.product_name} (x${i.quantity})`).join(', '),
+        reason: reasoning?.reason || 'Selected optimal product matching requirements',
+        alternatives: reasoning?.alternatives || [],
+        score: 1.0,
+      });
+
+      this.auditService.logMandateCheck(intent_mandate_id, {
+        mandate_id: intent_mandate_id,
+        mandate_type: 'INTENT',
+        constraints,
+        check_result: 'PASSED',
+      });
     }
 
     // ── Step 4: Create cart mandate ─────────────────────────────────
@@ -378,6 +460,15 @@ class MandateService {
       paymentExpiresAt.toISOString()
     );
 
+    if (this.auditService) {
+      this.auditService.logApproval(cartMandate.parent_mandate_id, {
+        cart_mandate_id: cartMandateId,
+        delegator_id: approvedBy,
+        decision: 'APPROVED',
+        payment_mandate_id: paymentMandateId,
+      });
+    }
+
     logger.info('Cart approved → Payment mandate created', {
       cart_mandate_id: cartMandateId,
       payment_mandate_id: paymentMandateId,
@@ -417,6 +508,22 @@ class MandateService {
       UPDATE mandates SET status = 'REJECTED', rejected_at = ?, rejected_by = ?, rejection_reason = ?
       WHERE mandate_id = ?
     `).run(now.toISOString(), rejectedBy, reason, cartMandateId);
+
+    if (this.auditService) {
+      this.auditService.logApproval(cartMandate.parent_mandate_id, {
+        cart_mandate_id: cartMandateId,
+        delegator_id: rejectedBy,
+        decision: 'REJECTED',
+        reason,
+      });
+      this.auditService.logOutcome(cartMandate.parent_mandate_id, {
+        transaction_id: 'N/A',
+        status: 'REJECTED',
+        total_amount: 0,
+        items_count: 0,
+        failure_reason: `Rejected by delegator: ${reason}`,
+      });
+    }
 
     logger.info('Cart mandate rejected', {
       cart_mandate_id: cartMandateId,
