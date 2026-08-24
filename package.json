@@ -1,0 +1,39 @@
+{
+  "name": "agentic-commerce-gateway",
+  "version": "1.0.0",
+  "description": "Agentic Commerce Gateway (ACG) — Making Razorpay merchants transactable by AI buyer agents with bounded authorization, audit trails, and safe failure handling.",
+  "main": "gateway/server.js",
+  "scripts": {
+    "dev": "node gateway/server.js",
+    "start": "node gateway/server.js",
+    "reset-db": "node db/reset.js",
+    "seed": "node db/seed.js",
+    "demo": "node demo/run-demo.js",
+    "demo:happy": "node demo/scenarios/happy-path.js",
+    "demo:spend-cap": "node demo/scenarios/spend-cap-exceeded.js",
+    "demo:ambiguous": "node demo/scenarios/ambiguous-match.js",
+    "demo:payment-declined": "node demo/scenarios/payment-declined.js"
+  },
+  "keywords": [
+    "agentic-commerce",
+    "razorpay",
+    "ai-agent",
+    "payments",
+    "mandate",
+    "audit-trail",
+    "ACP",
+    "AP2"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "better-sqlite3": "^11.0.0",
+    "dotenv": "^16.0.0",
+    "express": "^4.21.0",
+    "jsonwebtoken": "^9.0.0",
+    "razorpay": "^2.9.0",
+    "uuid": "^10.0.0",
+    "winston": "^3.14.0",
+    "zod": "^3.23.0"
+  }
+}
