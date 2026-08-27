@@ -22,6 +22,7 @@ const createPaymentRoutes = require('./routes/payment.routes');
 const createAuditRoutes = require('./routes/audit.routes');
 const { errorHandler } = require('./middleware/error.middleware');
 const { createAuditMiddleware } = require('./middleware/audit.middleware');
+const { authenticateAgent } = require('./middleware/auth.middleware');
 const logger = require('../lib/logger');
 
 // ── Load config (validates env vars) ────────────────────────────────
@@ -55,6 +56,9 @@ const app = express();
 
 // Parse JSON request bodies
 app.use(express.json());
+
+// Security: remove fingerprinting headers
+app.disable('x-powered-by');
 
 // Assign a unique trace ID to every request
 app.use((req, res, next) => {
@@ -103,10 +107,13 @@ app.get('/health', (req, res) => {
 });
 
 // ── API Routes ──────────────────────────────────────────────────────
+// Public: catalog and audit are readable without authentication
 app.use('/api/v1/catalog', createCatalogRoutes(catalogService));
-app.use('/api/v1/mandates', createMandateRoutes(mandateService));
-app.use('/api/v1/payments', createPaymentRoutes(paymentService));
 app.use('/api/v1/audit', createAuditRoutes(auditService));
+
+// Protected: mandate and payment routes require agent identity
+app.use('/api/v1/mandates', authenticateAgent(dbManager.db), createMandateRoutes(mandateService));
+app.use('/api/v1/payments', authenticateAgent(dbManager.db), createPaymentRoutes(paymentService));
 
 // Attach audit service to app for use in other services
 app.set('auditService', auditService);
@@ -135,11 +142,18 @@ const server = app.listen(PORT, () => {
   logger.info(`  Environment: ${config.server.env}`);
   logger.info(`  Database:    ${config.db.path}`);
   logger.info('');
-  logger.info('  Available Endpoints:');
-  logger.info(`  GET  http://localhost:${PORT}/health`);
-  logger.info(`  GET  http://localhost:${PORT}/api/v1/catalog/products`);
-  logger.info(`  GET  http://localhost:${PORT}/api/v1/catalog/products/:id`);
-  logger.info(`  GET  http://localhost:${PORT}/api/v1/catalog/search?q=...`);
+  logger.info('  Available Endpoints (public):');
+  logger.info(`  GET    http://localhost:${PORT}/health`);
+  logger.info(`  GET    http://localhost:${PORT}/api/v1/catalog/products`);
+  logger.info(`  GET    http://localhost:${PORT}/api/v1/catalog/products/:id`);
+  logger.info(`  GET    http://localhost:${PORT}/api/v1/catalog/search?q=...`);
+  logger.info(`  GET    http://localhost:${PORT}/api/v1/audit/transactions/:id`);
+  logger.info('  Protected Endpoints (require x-agent-id header):');
+  logger.info(`  POST   http://localhost:${PORT}/api/v1/mandates/intent`);
+  logger.info(`  POST   http://localhost:${PORT}/api/v1/mandates/cart`);
+  logger.info(`  POST   http://localhost:${PORT}/api/v1/mandates/cart/:id/approve`);
+  logger.info(`  POST   http://localhost:${PORT}/api/v1/payments/execute`);
+  logger.info(`  GET    http://localhost:${PORT}/api/v1/payments/:id`);
   logger.info('═══════════════════════════════════════════════════════════');
 });
 
