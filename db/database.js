@@ -86,9 +86,14 @@ class DatabaseManager {
         this.db.exec(sql);
         console.log(`[DatabaseManager] Migration applied: ${file}`);
       } catch (err) {
-        // If tables already exist, that's fine (IF NOT EXISTS handles it)
-        // Only throw on real errors
-        if (!err.message.includes('already exists')) {
+        // IF NOT EXISTS handles table/index re-creation.
+        // ALTER TABLE ADD COLUMN does not support IF NOT EXISTS in SQLite,
+        // so we swallow "duplicate column name" errors too.
+        const isIdempotentError =
+          err.message.includes('already exists') ||
+          err.message.includes('duplicate column name');
+
+        if (!isIdempotentError) {
           throw new Error(`Migration failed (${file}): ${err.message}`);
         }
         console.log(`[DatabaseManager] Migration already applied: ${file}`);

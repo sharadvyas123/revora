@@ -2,50 +2,149 @@
  * @module agent/decision-engine
  * @description Dual-mode product selection engine for the AI Buyer Agent.
  *
+ * v2 Update: Now source-agnostic — processes both:
+ *   - v1 catalog rows: { product, relevance_score, match_reason } where product is
+ *     the ACP Product Feed format from CatalogService._formatProduct().
+ *   - v2 discovery rows: { product, relevance_score, match_source } where product is
+ *     the unified Normalized Product Schema from NormalizerService.
+ *
+ * Both are normalized via _normalizeCandidate() before scoring.
+ *
  * Mode 1 — Gemini LLM (when GEMINI_API_KEY is set):
- *   Uses Google Gemini to read product descriptions, ratings, and catalog context,
- *   then reasons holistically about which product best serves the human's intent.
- *   Returns a natural language explanation + ranked alternatives.
+ *   Uses Google Gemini to reason holistically about which product best serves intent.
  *
- * Mode 2 — Local Weighted Scoring (fallback when no API key):
- *   Deterministic composite score:
- *     (0.4 × relevance) + (0.3 × rating) + (0.2 × price_value) + (0.1 × stock)
+ * Mode 2 — Local Weighted Scoring (deterministic fallback):
+ *   Composite: (0.4 × relevance) + (0.3 × rating) + (0.2 × price_value) + (0.1 × stock)
  *
- * @see agent/gemini-llm.js — Gemini AI integration layer
+ * @see agent/comparison-engine.js — Side-by-side comparison matrix
+ * @see docs/TRD.md Section 3.1 — Candidate Scoring Function
  */
 
 require('dotenv').config();
 const { isAvailable, decideWithGemini } = require('./gemini-llm');
+const { compare } = require('./comparison-engine');
 
-// ── Local Scoring Weights ───────────────────────────────────────────
+// ── Local Scoring Weights ───────────────────────────────────────────────
 const WEIGHTS = { relevance: 0.40, rating: 0.30, price_value: 0.20, stock: 0.10 };
 
-// ════════════════════════════════════════════════════════════════════
-//  PUBLIC API
-// ════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════
+//  SOURCE-AGNOSTIC ADAPTER
+// ═══════════════════════════════════════════════════════════════════
 
 /**
- * Evaluate search results and select the best product.
+ * Normalize a single candidate entry into a consistent shape, regardless of
+ * whether it originates from the v1 CatalogService or the v2 DiscoveryService.
+ *
+ * Input variants:
+ *   v1: { product: ACPFormat, relevance_score, match_reason }
+ *   v2: { product: NormalizedSchema, relevance_score, match_source }
+ *
+ * Output: { product, relevance_score } where product always has:
+ *   product_id, name, price.{amount, display}, rating, review_count,
+ *   stock.{available, quantity}, variants, policies
+ *
+ * @param {Object} entry - Raw candidate from search or discovery
+ * @returns {Object} Normalized candidate
+ * @private
+ */
+function _normalizeCandidate(entry) {
+  const p = entry.product;
+
+  // If already in Normalized Product Schema (has source_type), pass through
+  if (p.source_type) return entry;
+
+  // v1 ACP format: price is { amount, currency, display }, stock is { available, quantity }
+  // These match the normalized schema already — just ensure key fields exist.
+  return {
+    ...entry,
+    product: {
+      product_id:   p.product_id,
+      source_type:  'LOCAL_CATALOG',
+      source_name:  'ACG Local Catalog',
+      source_url:   `http://localhost:3000/api/v1/catalog/products/${p.product_id}`,
+      name:         p.name,
+      description:  p.description || '',
+      category:     p.category    || '',
+      subcategory:  p.subcategory || '',
+      price:        p.price,
+      stock:        p.stock,
+      variants:     p.variants    || [],
+      rating:       p.rating      ?? null,
+      review_count: p.review_count ?? 0,
+      attributes:   p.attributes  || {},
+      policies:     p.policies    || {},
+      media:        p.media       || [],
+      merchant_id:  p.merchant_id || null,
+      fetched_at:   p.updated_at  || new Date().toISOString(),
+    },
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  PUBLIC API
+// ═══════════════════════════════════════════════════════════════════
+
+/**
+ * Evaluate search/discovery results and select the best product.
  *
  * Automatically uses Gemini LLM if GEMINI_API_KEY is set, otherwise
  * falls back to the local weighted scoring engine.
  *
- * @param {Object[]} searchResults - Array of { product, relevance_score, match_reason }
+ * @param {Object[]} searchResults - Array of { product, relevance_score, match_reason|match_source }
+ *   Accepts both v1 CatalogService format and v2 DiscoveryService format.
  * @param {Object} intent - Parsed purchase intent
  * @returns {Promise<Object>} Decision result:
  *   { selected, alternatives, filters_applied, scored_candidates, reasoning, llm_mode }
  */
 async function decide(searchResults, intent) {
+  // Normalize all candidates to unified schema first
+  const normalizedResults = (searchResults || []).map(_normalizeCandidate);
+
   if (isAvailable()) {
     try {
-      const result = await decideWithGemini(searchResults, intent);
+      const result = await decideWithGemini(normalizedResults, intent);
       return { ...result, llm_mode: 'gemini' };
     } catch (err) {
       console.warn(`  ⚠ Gemini decision failed (${err.message}), falling back to local scoring`);
     }
   }
 
-  return decideLocal(searchResults, intent);
+  return decideLocal(normalizedResults, intent);
+}
+
+/**
+ * decide() + comparison matrix in one call.
+ * Used by the RecommendationService and agent tooling.
+ *
+ * @param {Object[]} searchResults - Raw search/discovery candidates
+ * @param {Object} intent - Parsed intent with budget, category, keywords
+ * @returns {Promise<Object>} { decision, comparison }
+ */
+async function decideWithComparison(searchResults, intent) {
+  const normalizedResults = (searchResults || []).map(_normalizeCandidate);
+  const decision = await decide(normalizedResults, intent);
+
+  // Build scored candidates array for comparison engine
+  // decision.scored_candidates has composite scores; re-attach product objects
+  const scoredForComparison = (decision.scored_candidates || []).map((sc) => {
+    const match = normalizedResults.find((r) => r.product.product_id === sc.product_id);
+    return match
+      ? {
+          product: match.product,
+          relevance_score: match.relevance_score,
+          scores: {
+            composite:   sc.composite_score,
+            relevance:   match.relevance_score,
+            rating:      sc.composite_score, // approximation when granular scores unavailable
+            price_value: sc.composite_score,
+            stock:       sc.composite_score,
+          },
+        }
+      : null;
+  }).filter(Boolean);
+
+  const comparison = compare(scoredForComparison, intent);
+  return { decision, comparison };
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -223,4 +322,4 @@ function formatPrice(paise) {
 
 function round(n) { return Math.round(n * 1000) / 1000; }
 
-module.exports = { decide, WEIGHTS, decideLocal };
+module.exports = { decide, decideWithComparison, WEIGHTS, decideLocal };

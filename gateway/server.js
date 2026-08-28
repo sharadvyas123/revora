@@ -15,11 +15,15 @@ const CatalogService = require('./services/catalog.service');
 const MandateService = require('./services/mandate.service');
 const PaymentService = require('./services/payment.service');
 const AuditService = require('./services/audit.service');
+const DiscoveryService = require('./services/discovery.service');
+const RecommendationService = require('./services/recommendation.service');
 const RazorpayWrapper = require('../lib/razorpay');
 const createCatalogRoutes = require('./routes/catalog.routes');
 const createMandateRoutes = require('./routes/mandate.routes');
 const createPaymentRoutes = require('./routes/payment.routes');
 const createAuditRoutes = require('./routes/audit.routes');
+const createDiscoveryRoutes = require('./routes/discovery.routes');
+const createRecommendationRoutes = require('./routes/recommendation.routes');
 const { errorHandler } = require('./middleware/error.middleware');
 const { createAuditMiddleware } = require('./middleware/audit.middleware');
 const { authenticateAgent } = require('./middleware/auth.middleware');
@@ -43,6 +47,8 @@ logger.info('Database initialized', { path: config.db.path });
 const auditService = new AuditService(dbManager.db);
 const catalogService = new CatalogService(dbManager.db);
 const mandateService = new MandateService(dbManager.db, auditService);
+const discoveryService = new DiscoveryService(dbManager.db, catalogService);
+const recommendationService = new RecommendationService(dbManager.db, discoveryService, catalogService);
 const razorpay = new RazorpayWrapper({
   keyId: config.razorpay.keyId,
   keySecret: config.razorpay.keySecret,
@@ -111,6 +117,12 @@ app.get('/health', (req, res) => {
 app.use('/api/v1/catalog', createCatalogRoutes(catalogService));
 app.use('/api/v1/audit', createAuditRoutes(auditService));
 
+// v2: Multi-source discovery (public)
+app.use('/api/v1/discovery', createDiscoveryRoutes(discoveryService));
+
+// v2: Recommendation & comparison engine (public)
+app.use('/api/v1/recommendations', createRecommendationRoutes(recommendationService));
+
 // Protected: mandate and payment routes require agent identity
 app.use('/api/v1/mandates', authenticateAgent(dbManager.db), createMandateRoutes(mandateService));
 app.use('/api/v1/payments', authenticateAgent(dbManager.db), createPaymentRoutes(paymentService));
@@ -137,7 +149,7 @@ const PORT = config.server.port;
 
 const server = app.listen(PORT, () => {
   logger.info('═══════════════════════════════════════════════════════════');
-  logger.info('  Agentic Commerce Gateway (ACG) — Server Started');
+  logger.info('  Agentic Commerce Gateway (ACG) — Server Started  v2');
   logger.info(`  Port:        ${PORT}`);
   logger.info(`  Environment: ${config.server.env}`);
   logger.info(`  Database:    ${config.db.path}`);
@@ -148,6 +160,11 @@ const server = app.listen(PORT, () => {
   logger.info(`  GET    http://localhost:${PORT}/api/v1/catalog/products/:id`);
   logger.info(`  GET    http://localhost:${PORT}/api/v1/catalog/search?q=...`);
   logger.info(`  GET    http://localhost:${PORT}/api/v1/audit/transactions/:id`);
+  logger.info('  v2 Discovery Endpoints (public):');
+  logger.info(`  GET    http://localhost:${PORT}/api/v1/discovery/search?q=...`);
+  logger.info('  v2 Recommendation Endpoints (public):');
+  logger.info(`  POST   http://localhost:${PORT}/api/v1/recommendations/decide`);
+  logger.info(`  POST   http://localhost:${PORT}/api/v1/recommendations/compare`);
   logger.info('  Protected Endpoints (require x-agent-id header):');
   logger.info(`  POST   http://localhost:${PORT}/api/v1/mandates/intent`);
   logger.info(`  POST   http://localhost:${PORT}/api/v1/mandates/cart`);
