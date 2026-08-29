@@ -40,6 +40,8 @@ const createCartSchema = z.object({
     variant_id: z.string().optional(),
     quantity: z.number().int().positive().optional().default(1),
   })).min(1, 'At least one item is required'),
+  coupon_code: z.string().optional(),
+  merchant_id_for_coupon: z.string().optional(),
   reasoning: z.object({
     query: z.string().optional(),
     reason: z.string().optional(),
@@ -57,6 +59,13 @@ const approveCartSchema = z.object({
 const rejectCartSchema = z.object({
   rejected_by: z.string().min(1, 'rejected_by is required'),
   reason: z.string().optional().default(''),
+});
+
+const confirmCartSchema = z.object({
+  cart_mandate_id: z.string().min(1, 'cart_mandate_id is required'),
+  user_confirmation: z.boolean({ required_error: 'user_confirmation (boolean) is required' }),
+  channel: z.enum(['VOICE', 'TEXT', 'API'], { required_error: 'channel must be VOICE, TEXT, or API' }),
+  confirmation_phrase: z.string().optional().default(''),
 });
 
 const mandateIdSchema = z.object({
@@ -186,6 +195,35 @@ function createMandateRoutes(mandateService) {
       }
     }
   );
+
+  /**
+   * POST /api/v1/mandates/cart/confirm
+   * 
+   * Record explicit user purchase confirmation on a cart mandate.
+   * Must be called before payment execution is allowed.
+   */
+  router.post('/cart/confirm', validate(confirmCartSchema, 'body'), (req, res, next) => {
+    try {
+      const result = mandateService.confirmCartMandate(req.body);
+
+      res.status(200).json({
+        status: 'success',
+        message: result.ready_for_payment
+          ? 'Purchase confirmed. Payment execution is now allowed.'
+          : 'Purchase rejected by user. Payment execution is blocked.',
+        data: result,
+        meta: {
+          timestamp: new Date().toISOString(),
+          trace_id: req.traceId,
+          ...(result.ready_for_payment && {
+            next_step: 'POST /api/v1/payments/execute (with payment mandate token)',
+          }),
+        },
+      });
+    } catch (err) {
+      next(err);
+    }
+  });
 
   /**
    * GET /api/v1/mandates/:id

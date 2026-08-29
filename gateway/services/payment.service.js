@@ -29,6 +29,7 @@ const {
   MandateUsedError,
   ChainBrokenError,
   InvalidStateTransitionError,
+  ConfirmationRequiredError,
   OutOfStockError,
   StockChangedError,
   PriceChangedError,
@@ -130,6 +131,14 @@ class PaymentService {
 
       // Ensure we have the resolved intent mandate ID
       auditTrailId = intentMandate.mandate_id;
+
+      // ── Step 2b: Enforce Explicit Purchase Confirmation Gate ────────
+      // Cart mandate must have confirmation_status === 'EXPLICIT_CONFIRMED'
+      // before any payment is allowed.
+      const confirmationStatus = cartMandate.confirmation_status || 'PENDING';
+      if (confirmationStatus !== 'EXPLICIT_CONFIRMED') {
+        throw new ConfirmationRequiredError(cartMandate.mandate_id);
+      }
 
       // ── Step 3: Re-validate stock and prices ────────────────────────
       const items = JSON.parse(paymentMandate.items);

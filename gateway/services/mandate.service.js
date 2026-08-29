@@ -43,10 +43,12 @@ class MandateService {
   /**
    * @param {import('better-sqlite3').Database} db - The better-sqlite3 database instance
    * @param {import('./audit.service')} [auditService] - Optional AuditService instance
+   * @param {import('./coupon.service')} [couponService] - Optional CouponService for discount processing
    */
-  constructor(db, auditService) {
+  constructor(db, auditService, couponService) {
     this.db = db;
     this.auditService = auditService || null;
+    this.couponService = couponService || null;
   }
 
   // ════════════════════════════════════════════════════════════════════
@@ -154,7 +156,9 @@ class MandateService {
   /**
    * Create a Cart Mandate by selecting products within intent constraints.
    * Validates each item against the parent intent's spending rules.
-   * 
+   * Supports optional coupon codes — discount is applied BEFORE the spend cap check
+   * so a coupon can bring an over-budget cart back within the intent limit.
+   *
    * @param {Object} params
    * @param {string} params.intent_mandate_id - Parent intent mandate ID
    * @param {string} params.agent_id - Agent creating the cart
@@ -162,13 +166,12 @@ class MandateService {
    * @param {string} params.items[].product_id - Product to add
    * @param {string} [params.items[].variant_id] - Specific variant
    * @param {number} [params.items[].quantity=1] - Quantity
+   * @param {string} [params.coupon_code] - Optional coupon/promo code to apply
+   * @param {string} [params.merchant_id_for_coupon] - Merchant to validate coupon against
    * @param {Object} [params.reasoning] - Agent's reasoning for selection
-   * @param {string} [params.reasoning.query] - Original search query
-   * @param {string} [params.reasoning.reason] - Why this product was chosen
-   * @param {Object[]} [params.reasoning.alternatives] - Other products considered
    * @returns {Object} Created cart mandate (status: PENDING_APPROVAL)
    */
-  createCartMandate({ intent_mandate_id, agent_id, items, reasoning }) {
+  createCartMandate({ intent_mandate_id, agent_id, items, reasoning, coupon_code, merchant_id_for_coupon }) {
     // ── Step 1: Validate parent intent mandate ──────────────────────
     const intentMandate = this.db.prepare(
       'SELECT * FROM mandates WHERE mandate_id = ? AND type = ?'
@@ -282,28 +285,99 @@ class MandateService {
       });
     }
 
-    // ── Step 3: Validate total amount against spend cap ──────────────
-    if (totalAmount > constraints.max_amount) {
+    // ── Step 3: Apply coupon (if provided) & compute final amount ────
+    let originalAmount = totalAmount;
+    let discountAmount = 0;
+    let finalAmount    = totalAmount;
+    let appliedCoupon  = null;
+
+    if (coupon_code && this.couponService) {
+      try {
+        // Determine the merchant to validate against: from first item or caller-provided
+        const merchantId = merchant_id_for_coupon ||
+          (resolvedItems[0]
+            ? this.db.prepare('SELECT merchant_id FROM products WHERE product_id = ?')
+                .get(resolvedItems[0].product_id)?.merchant_id
+            : null);
+
+        // Determine primary category from first item
+        const firstProduct = resolvedItems[0]
+          ? this.db.prepare('SELECT category FROM products WHERE product_id = ?')
+              .get(resolvedItems[0].product_id)
+          : null;
+        const category = firstProduct?.category || null;
+
+        // Audit: COUPON_PROVIDED (pre-validation signal)
+        if (this.auditService) {
+          this.auditService.logEvent({
+            audit_trail_id: intent_mandate_id,
+            step: 'DECISION',
+            data: {
+              action: 'COUPON_PROVIDED',
+              coupon_code,
+              cart_total: totalAmount,
+            },
+          });
+        }
+
+        const couponResult = this.couponService.validateCoupon({
+          code:            coupon_code,
+          merchant_id:     merchantId,
+          amount:          totalAmount,
+          category,
+          audit_trail_id:  intent_mandate_id,
+        });
+
+        discountAmount = couponResult.discount_amount;
+        finalAmount    = couponResult.final_amount;
+        appliedCoupon  = couponResult.coupon;
+
+        logger.info('Coupon applied to cart mandate', {
+          coupon_code,
+          original_amount: originalAmount,
+          discount_amount:  discountAmount,
+          final_amount:     finalAmount,
+        });
+      } catch (couponErr) {
+        // Coupon validation failure is non-fatal: log it and proceed without discount
+        logger.warn(`Coupon validation failed for "${coupon_code}": ${couponErr.message}`);
+        if (this.auditService) {
+          this.auditService.logError(intent_mandate_id, {
+            step_context: 'coupon_validation',
+            error_code:   couponErr.code || 'COUPON_ERROR',
+            error_message: couponErr.message,
+          });
+        }
+      }
+    }
+
+    // ── Step 4: Validate FINAL amount against spend cap ───────────────
+    // Important: use finalAmount (after coupon discount) so the coupon
+    // can bring an over-budget cart back within the spend limit.
+    const amountToCheck = finalAmount;
+    if (amountToCheck > constraints.max_amount) {
       if (this.auditService) {
         this.auditService.logMandateCheck(intent_mandate_id, {
           mandate_id: intent_mandate_id,
           mandate_type: 'INTENT',
           constraints,
           check_result: 'FAILED',
-          violation: `Amount ${totalAmount} exceeds max_amount ${constraints.max_amount}`,
+          violation: `Final amount ${amountToCheck} exceeds max_amount ${constraints.max_amount}${
+            discountAmount > 0 ? ` (original: ${originalAmount}, discount: ${discountAmount})` : ''
+          }`,
         });
         this.auditService.logOutcome(intent_mandate_id, {
           transaction_id: 'N/A',
           status: 'FAILED',
-          total_amount: totalAmount,
+          total_amount: amountToCheck,
           items_count: items.length,
-          failure_reason: `Spend cap exceeded: total ${totalAmount} > cap ${constraints.max_amount}`,
+          failure_reason: `Spend cap exceeded: final ${amountToCheck} > cap ${constraints.max_amount}`,
         });
       }
       throw new AmountExceededError(
         intent_mandate_id,
         constraints.max_amount,
-        totalAmount,
+        amountToCheck,
         constraints.currency
       );
     }
@@ -326,7 +400,7 @@ class MandateService {
       });
     }
 
-    // ── Step 4: Create cart mandate ─────────────────────────────────
+    // ── Step 5: Create cart mandate ──────────────────────────────────
     const mandateId = `mdt_cart_${uuidv4().split('-')[0]}`;
     const now = new Date();
     // Cart mandate inherits remaining TTL from intent, max 30 minutes for approval
@@ -348,8 +422,11 @@ class MandateService {
     this.db.prepare(`
       INSERT INTO mandates (
         mandate_id, type, status, parent_mandate_id, delegator_id, agent_id,
-        merchant_id, constraints, items, reasoning, token, created_at, expires_at
-      ) VALUES (?, 'CART', 'PENDING_APPROVAL', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        merchant_id, constraints, items, reasoning, token,
+        coupon_code, original_amount, discount_amount, final_amount,
+        created_at, expires_at
+      ) VALUES (?, 'CART', 'PENDING_APPROVAL', ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?)
     `).run(
       mandateId,
       intent_mandate_id,
@@ -360,6 +437,10 @@ class MandateService {
       JSON.stringify(resolvedItems),
       reasoning ? JSON.stringify(reasoning) : null,
       token,
+      appliedCoupon ? coupon_code : null,
+      originalAmount,
+      discountAmount,
+      finalAmount,
       now.toISOString(),
       expiresAt.toISOString()
     );
@@ -367,7 +448,10 @@ class MandateService {
     logger.info('Cart mandate created', {
       mandate_id: mandateId,
       parent: intent_mandate_id,
-      total_amount: totalAmount,
+      original_amount: originalAmount,
+      discount_amount: discountAmount,
+      final_amount: finalAmount,
+      coupon_code: appliedCoupon ? coupon_code : null,
       item_count: resolvedItems.length,
       status: 'PENDING_APPROVAL',
     });
@@ -375,6 +459,117 @@ class MandateService {
     return this._formatMandate(
       this.db.prepare('SELECT * FROM mandates WHERE mandate_id = ?').get(mandateId)
     );
+  }
+
+  // ════════════════════════════════════════════════════════════════════
+  //  EXPLICIT PURCHASE CONFIRMATION GATE
+  // ════════════════════════════════════════════════════════════════════
+
+  /**
+   * Record explicit user purchase confirmation on a cart mandate.
+   * This must be called BEFORE payment execution is allowed.
+   *
+   * @param {Object} params
+   * @param {string} params.cart_mandate_id - Cart mandate to confirm
+   * @param {boolean} params.user_confirmation - true = confirm, false = reject
+   * @param {string} params.channel - Confirmation channel (VOICE, TEXT, API)
+   * @param {string} [params.confirmation_phrase] - Exact phrase the user spoke/typed
+   * @returns {Object} { mandate_id, confirmation_status, confirmed_at, ready_for_payment }
+   */
+  confirmCartMandate({ cart_mandate_id, user_confirmation, channel, confirmation_phrase }) {
+    const cartMandate = this.db.prepare(
+      'SELECT * FROM mandates WHERE mandate_id = ? AND type = ?'
+    ).get(cart_mandate_id, 'CART');
+
+    if (!cartMandate) {
+      throw new ChainBrokenError(cart_mandate_id, 'not_found');
+    }
+
+    // Only allow confirmation on PENDING_APPROVAL or APPROVED carts
+    if (!['PENDING_APPROVAL', 'APPROVED'].includes(cartMandate.status)) {
+      throw new InvalidStateTransitionError(
+        'mandate', cart_mandate_id, cartMandate.status,
+        user_confirmation ? 'EXPLICIT_CONFIRMED' : 'REJECTED'
+      );
+    }
+
+    const now = new Date().toISOString();
+
+    if (user_confirmation) {
+      // ── EXPLICIT CONFIRMED ─────────────────────────────────────────
+      this.db.prepare(`
+        UPDATE mandates
+        SET confirmation_status  = 'EXPLICIT_CONFIRMED',
+            confirmed_at         = ?,
+            confirmation_channel = ?,
+            confirmation_phrase  = ?
+        WHERE mandate_id = ?
+      `).run(now, channel, confirmation_phrase || null, cart_mandate_id);
+
+      if (this.auditService) {
+        this.auditService.logEvent({
+          audit_trail_id: cartMandate.parent_mandate_id,
+          step: 'APPROVAL',
+          data: {
+            action: 'CONFIRMATION_RECORDED',
+            cart_mandate_id,
+            channel,
+            confirmation_phrase: confirmation_phrase || null,
+            confirmed_at: now,
+          },
+        });
+      }
+
+      logger.info('Explicit purchase confirmation recorded', {
+        cart_mandate_id,
+        channel,
+        confirmation_status: 'EXPLICIT_CONFIRMED',
+      });
+
+      return {
+        mandate_id: cart_mandate_id,
+        confirmation_status: 'EXPLICIT_CONFIRMED',
+        confirmed_at: now,
+        ready_for_payment: true,
+      };
+    } else {
+      // ── REJECTED ──────────────────────────────────────────────────
+      this.db.prepare(`
+        UPDATE mandates
+        SET confirmation_status  = 'REJECTED',
+            confirmed_at         = ?,
+            confirmation_channel = ?,
+            confirmation_phrase  = ?
+        WHERE mandate_id = ?
+      `).run(now, channel, confirmation_phrase || null, cart_mandate_id);
+
+      if (this.auditService) {
+        this.auditService.logEvent({
+          audit_trail_id: cartMandate.parent_mandate_id,
+          step: 'APPROVAL',
+          data: {
+            action: 'CONFIRMATION_REJECTED',
+            cart_mandate_id,
+            channel,
+            confirmation_phrase: confirmation_phrase || null,
+            confirmed_at: now,
+          },
+        });
+      }
+
+      logger.info('Purchase confirmation rejected by user', {
+        cart_mandate_id,
+        channel,
+        confirmation_status: 'REJECTED',
+      });
+
+      return {
+        mandate_id: cart_mandate_id,
+        confirmation_status: 'REJECTED',
+        confirmed_at: now,
+        ready_for_payment: false,
+      };
+    }
   }
 
   // ════════════════════════════════════════════════════════════════════
@@ -668,6 +863,18 @@ class MandateService {
           total_display: `₹${(totalAmount / 100).toLocaleString('en-IN', { minimumFractionDigits: 2 })}`,
         },
       }),
+      // Coupon & discount fields (v2)
+      ...(row.coupon_code != null && {
+        coupon: {
+          code:             row.coupon_code,
+          original_amount:  row.original_amount  ?? totalAmount,
+          discount_amount:  row.discount_amount  ?? 0,
+          final_amount:     row.final_amount      ?? totalAmount,
+          original_display: _fmtPaise(row.original_amount  ?? totalAmount),
+          discount_display: _fmtPaise(row.discount_amount  ?? 0),
+          final_display:    _fmtPaise(row.final_amount     ?? totalAmount),
+        },
+      }),
       ...(reasoning && { reasoning }),
       token: row.token,
       created_at: row.created_at,
@@ -675,6 +882,11 @@ class MandateService {
       ...(row.approved_at && { approved_at: row.approved_at, approved_by: row.approved_by }),
       ...(row.rejected_at && { rejected_at: row.rejected_at, rejected_by: row.rejected_by, rejection_reason: row.rejection_reason }),
       ...(row.used_at && { used_at: row.used_at }),
+      // Confirmation gate fields (Phase 13)
+      confirmation_status: row.confirmation_status || 'PENDING',
+      ...(row.confirmed_at && { confirmed_at: row.confirmed_at }),
+      ...(row.confirmation_channel && { confirmation_channel: row.confirmation_channel }),
+      ...(row.confirmation_phrase && { confirmation_phrase: row.confirmation_phrase }),
     };
   }
 
@@ -686,6 +898,12 @@ class MandateService {
     if (!str) return fallback;
     try { return JSON.parse(str); } catch { return fallback; }
   }
+}
+
+/** Format paise as INR display string @private */
+function _fmtPaise(paise) {
+  if (paise == null) return null;
+  return `₹${(paise / 100).toLocaleString('en-IN', { minimumFractionDigits: 2 })}`;
 }
 
 module.exports = MandateService;

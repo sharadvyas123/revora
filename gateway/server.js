@@ -8,6 +8,7 @@
  * @see docs/architecture.md Section 2.1 — Component Breakdown
  */
 
+const path = require('path');
 const express = require('express');
 const { v4: uuidv4 } = require('uuid');
 const DatabaseManager = require('../db/database');
@@ -17,6 +18,7 @@ const PaymentService = require('./services/payment.service');
 const AuditService = require('./services/audit.service');
 const DiscoveryService = require('./services/discovery.service');
 const RecommendationService = require('./services/recommendation.service');
+const CouponService = require('./services/coupon.service');
 const RazorpayWrapper = require('../lib/razorpay');
 const createCatalogRoutes = require('./routes/catalog.routes');
 const createMandateRoutes = require('./routes/mandate.routes');
@@ -24,6 +26,9 @@ const createPaymentRoutes = require('./routes/payment.routes');
 const createAuditRoutes = require('./routes/audit.routes');
 const createDiscoveryRoutes = require('./routes/discovery.routes');
 const createRecommendationRoutes = require('./routes/recommendation.routes');
+const createCouponRoutes = require('./routes/coupon.routes');
+const createVoiceRoutes = require('./routes/voice.routes');
+const VoiceInterface = require('../agent/voice/voice-interface');
 const { errorHandler } = require('./middleware/error.middleware');
 const { createAuditMiddleware } = require('./middleware/audit.middleware');
 const { authenticateAgent } = require('./middleware/auth.middleware');
@@ -46,14 +51,17 @@ logger.info('Database initialized', { path: config.db.path });
 // ── Initialize Services ─────────────────────────────────────────────
 const auditService = new AuditService(dbManager.db);
 const catalogService = new CatalogService(dbManager.db);
-const mandateService = new MandateService(dbManager.db, auditService);
 const discoveryService = new DiscoveryService(dbManager.db, catalogService);
 const recommendationService = new RecommendationService(dbManager.db, discoveryService, catalogService);
+const couponService = new CouponService(dbManager.db, auditService);
+const mandateService = new MandateService(dbManager.db, auditService, couponService);
+const voiceInterface = new VoiceInterface();
 const razorpay = new RazorpayWrapper({
   keyId: config.razorpay.keyId,
   keySecret: config.razorpay.keySecret,
 });
 const paymentService = new PaymentService(dbManager.db, razorpay, auditService);
+
 
 // ── Create Express App ──────────────────────────────────────────────
 const app = express();
@@ -123,6 +131,18 @@ app.use('/api/v1/discovery', createDiscoveryRoutes(discoveryService));
 // v2: Recommendation & comparison engine (public)
 app.use('/api/v1/recommendations', createRecommendationRoutes(recommendationService));
 
+// v2: Coupon & Voucher Management (public — agents read coupons before checkout)
+app.use('/api/v1/coupons', createCouponRoutes(couponService));
+
+// v2: Voice Interaction API (public)
+app.use('/api/v1/voice', createVoiceRoutes(voiceInterface, mandateService, paymentService, recommendationService, couponService));
+
+// Serve static web UI files & voice studio at /voice
+app.use('/public', express.static(path.join(__dirname, 'public')));
+app.get('/voice', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'voice.html'));
+});
+
 // Protected: mandate and payment routes require agent identity
 app.use('/api/v1/mandates', authenticateAgent(dbManager.db), createMandateRoutes(mandateService));
 app.use('/api/v1/payments', authenticateAgent(dbManager.db), createPaymentRoutes(paymentService));
@@ -165,10 +185,19 @@ const server = app.listen(PORT, () => {
   logger.info('  v2 Recommendation Endpoints (public):');
   logger.info(`  POST   http://localhost:${PORT}/api/v1/recommendations/decide`);
   logger.info(`  POST   http://localhost:${PORT}/api/v1/recommendations/compare`);
+  logger.info('  v2 Coupon Endpoints (public):');
+  logger.info(`  GET    http://localhost:${PORT}/api/v1/coupons?merchant_id=...`);
+  logger.info(`  POST   http://localhost:${PORT}/api/v1/coupons/validate`);
+  logger.info(`  POST   http://localhost:${PORT}/api/v1/coupons/apply`);
+  logger.info('  v2 Voice Interaction Web UI & API (public):');
+  logger.info(`  GET    http://localhost:${PORT}/voice  <-- Open in browser for Mic/Speaker demo`);
+  logger.info(`  POST   http://localhost:${PORT}/api/v1/voice/process`);
+  logger.info(`  POST   http://localhost:${PORT}/api/v1/voice/confirm-prompt`);
   logger.info('  Protected Endpoints (require x-agent-id header):');
   logger.info(`  POST   http://localhost:${PORT}/api/v1/mandates/intent`);
   logger.info(`  POST   http://localhost:${PORT}/api/v1/mandates/cart`);
   logger.info(`  POST   http://localhost:${PORT}/api/v1/mandates/cart/:id/approve`);
+  logger.info(`  POST   http://localhost:${PORT}/api/v1/mandates/cart/confirm`);
   logger.info(`  POST   http://localhost:${PORT}/api/v1/payments/execute`);
   logger.info(`  GET    http://localhost:${PORT}/api/v1/payments/:id`);
   logger.info('═══════════════════════════════════════════════════════════');

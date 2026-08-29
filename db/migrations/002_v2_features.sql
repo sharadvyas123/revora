@@ -66,6 +66,9 @@ ALTER TABLE mandates ADD COLUMN original_amount     INTEGER;
 ALTER TABLE mandates ADD COLUMN discount_amount     INTEGER DEFAULT 0;
 ALTER TABLE mandates ADD COLUMN final_amount        INTEGER;
 ALTER TABLE mandates ADD COLUMN confirmation_status TEXT DEFAULT 'PENDING';
+ALTER TABLE mandates ADD COLUMN confirmed_at         TEXT;
+ALTER TABLE mandates ADD COLUMN confirmation_channel TEXT;
+ALTER TABLE mandates ADD COLUMN confirmation_phrase  TEXT;
 ALTER TABLE mandates ADD COLUMN channel             TEXT DEFAULT 'TEXT';
 
 -- ============================================================

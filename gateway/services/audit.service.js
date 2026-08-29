@@ -8,15 +8,22 @@
  * - Dispute resolution (what the AI agent decided and why)
  * - Debugging (full step-by-step replay of any transaction)
  * 
- * Step Taxonomy:
- *   REQUEST        — User prompt parsed, intent defined
- *   DISCOVERY      — Catalog search queries & matching candidates
- *   DECISION       — AI reasoning for product selection vs alternatives
- *   MANDATE_CHECK  — Constraint evaluation (spend cap, category)
- *   APPROVAL       — Human approval/rejection with delegator context
- *   PAYMENT        — Razorpay order creation, token consumption, capture
- *   OUTCOME        — Final state (CAPTURED, REJECTED, FAILED)
- *   ERROR          — Unexpected errors during any step
+ * Step Taxonomy (v1 + v2):
+ *   REQUEST              — User prompt parsed, intent defined
+ *   DISCOVERY            — Catalog search queries & matching candidates (v1)
+ *   PRODUCT_DISCOVERY    — Multi-source discovery (local + external web) (v2)
+ *   PRODUCT_RECOMMENDATION — AI-scored ranking of discovered products (v2)
+ *   PRODUCT_COMPARISON   — Side-by-side comparison matrix generated (v2)
+ *   COUPON_PROVIDED      — Available coupons listed for the merchant (v2)
+ *   COUPON_VALIDATED     — Coupon validated, discount amount computed (v2)
+ *   DISCOUNT_APPLIED     — Coupon applied and discounted cart created (v2)
+ *   DECISION             — AI reasoning for product selection vs alternatives
+ *   MANDATE_CHECK        — Constraint evaluation (spend cap, category)
+ *   APPROVAL             — Human approval/rejection with delegator context
+ *   PURCHASE_CONFIRMATION — Explicit user confirmation recorded (v2)
+ *   PAYMENT              — Razorpay order creation, token consumption, capture
+ *   OUTCOME              — Final state (CAPTURED, REJECTED, FAILED)
+ *   ERROR                — Unexpected errors during any step
  * 
  * Immutability is enforced at the database level by SQL triggers that
  * block any UPDATE or DELETE on the audit_entries table.
@@ -216,6 +223,143 @@ class AuditService {
         error_message,
         ...(stack && { stack: stack.substring(0, 500) }),
         action: 'error_occurred',
+      },
+    });
+  }
+
+  // ── v2 Convenience Loggers ─────────────────────────────────────────
+
+  /**
+   * Log a PRODUCT_DISCOVERY step — multi-source product discovery (v2).
+   * Fired after calling GET /api/v1/discovery/search.
+   */
+  logProductDiscovery(auditTrailId, { agent_id, query, sources_queried, total_found, top_results }) {
+    return this.logEvent({
+      audit_trail_id: auditTrailId,
+      step: 'PRODUCT_DISCOVERY',
+      data: {
+        agent_id,
+        query,
+        sources_queried,
+        total_found,
+        top_results,
+        action: 'multi_source_discovery_complete',
+      },
+    });
+  }
+
+  /**
+   * Log a PRODUCT_RECOMMENDATION step — AI-scored product ranking (v2).
+   * Fired after calling POST /api/v1/recommendations/decide.
+   */
+  logProductRecommendation(auditTrailId, { agent_id, query, recommended_product_id, recommendation_reason, candidates_evaluated }) {
+    return this.logEvent({
+      audit_trail_id: auditTrailId,
+      step: 'PRODUCT_RECOMMENDATION',
+      data: {
+        agent_id,
+        query,
+        recommended_product_id,
+        recommendation_reason,
+        candidates_evaluated,
+        action: 'recommendation_generated',
+      },
+    });
+  }
+
+  /**
+   * Log a PRODUCT_COMPARISON step — side-by-side comparison matrix (v2).
+   * Fired after calling POST /api/v1/recommendations/compare.
+   */
+  logProductComparison(auditTrailId, { agent_id, comparison_id, product_ids, winner_product_id }) {
+    return this.logEvent({
+      audit_trail_id: auditTrailId,
+      step: 'PRODUCT_COMPARISON',
+      data: {
+        agent_id,
+        comparison_id,
+        product_ids,
+        winner_product_id,
+        action: 'comparison_matrix_generated',
+      },
+    });
+  }
+
+  /**
+   * Log a COUPON_PROVIDED step — available coupons listed for the merchant (v2).
+   * Fired after calling GET /api/v1/coupons.
+   */
+  logCouponProvided(auditTrailId, { agent_id, merchant_id, coupons_found, coupon_codes }) {
+    return this.logEvent({
+      audit_trail_id: auditTrailId,
+      step: 'COUPON_PROVIDED',
+      data: {
+        agent_id,
+        merchant_id,
+        coupons_found,
+        coupon_codes,
+        action: 'coupons_listed',
+      },
+    });
+  }
+
+  /**
+   * Log a COUPON_VALIDATED step — coupon code validated, discount computed (v2).
+   * Fired after calling POST /api/v1/coupons/validate.
+   */
+  logCouponValidated(auditTrailId, { agent_id, coupon_code, merchant_id, original_amount, discount_amount, final_amount, valid }) {
+    return this.logEvent({
+      audit_trail_id: auditTrailId,
+      step: 'COUPON_VALIDATED',
+      data: {
+        agent_id,
+        coupon_code,
+        merchant_id,
+        original_amount,
+        discount_amount,
+        final_amount,
+        valid,
+        action: valid ? 'coupon_valid' : 'coupon_invalid',
+      },
+    });
+  }
+
+  /**
+   * Log a DISCOUNT_APPLIED step — coupon consumed and discounted cart created (v2).
+   * Fired after cart mandate is created with a coupon applied.
+   */
+  logDiscountApplied(auditTrailId, { agent_id, cart_mandate_id, coupon_code, original_amount, discount_amount, final_amount }) {
+    return this.logEvent({
+      audit_trail_id: auditTrailId,
+      step: 'DISCOUNT_APPLIED',
+      data: {
+        agent_id,
+        cart_mandate_id,
+        coupon_code,
+        original_amount,
+        discount_amount,
+        final_amount,
+        action: 'discount_applied_to_cart',
+      },
+    });
+  }
+
+  /**
+   * Log a PURCHASE_CONFIRMATION step — explicit user confirmation recorded (v2).
+   * Fired after calling POST /api/v1/mandates/cart/confirm.
+   * This is the Phase 13 security gate — payment cannot proceed without it.
+   */
+  logPurchaseConfirmation(auditTrailId, { agent_id, cart_mandate_id, user_confirmation, channel, confirmation_phrase }) {
+    return this.logEvent({
+      audit_trail_id: auditTrailId,
+      step: 'PURCHASE_CONFIRMATION',
+      data: {
+        agent_id,
+        cart_mandate_id,
+        user_confirmation,
+        channel,
+        ...(confirmation_phrase && { confirmation_phrase }),
+        action: user_confirmation ? 'purchase_confirmed' : 'purchase_rejected',
       },
     });
   }
